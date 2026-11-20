@@ -1,0 +1,314 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: ResearchMate - arXiv 논문 RAG 챗봇 (CloudFront+S3, Cognito, API Gateway, Lambda, Bedrock, DynamoDB, EventBridge)
+
+Parameters:
+  BedrockRegion:
+    Type: String
+    Default: us-east-1
+    Description: Bedrock(임베딩/LLM)을 호출할 리전
+  LlmModelId:
+    Type: String
+    Default: anthropic.claude-opus-5-5
+  EmbedModelId:
+    Type: String
+    Default: amazon.titan-embed-text-v2:0
+  Keywords:
+    Type: String
+    Default: retrieval augmented generation,large language model agents,vision transformer
+    Description: 매일 수집할 arXiv 키워드 (쉼표 구분)
+  DailyLimit:
+    Type: Number
+    Default: 30
+    Description: 사용자 1명당 하루 LLM/검색 호출 한도
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: 월 비용 경보 받을 이메일 (비우면 예산 경보 생성 안 함)
+  MonthlyBudgetUsd:
+    Type: Number
+    Default: 10
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+Globals:
+  Function:
+    Runtime: python3.13
+    Architectures: [x86_64]
+    MemorySize: 1024
+    Environment:
+      Variables:
+        PAPERS_TABLE: !Ref PapersTable
+        CHUNKS_TABLE: !Ref ChunksTable
+        CHATS_TABLE: !Ref ChatsTable
+        DOCS_BUCKET: !Sub "${AWS::StackName}-docs-${AWS::AccountId}"
+        BEDROCK_REGION: !Ref BedrockRegion
+        LLM_MODEL_ID: !Ref LlmModelId
+        EMBED_MODEL_ID: !Ref EmbedModelId
+
+Resources:
+  # ------------------------------------------------------------ 저장소
+  DocsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-docs-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+
+  WebBucket:
+    Type: AWS::S3::Bucket
+
+  PapersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{ AttributeName: paper_id, AttributeType: S }]
+      KeySchema: [{ AttributeName: paper_id, KeyType: HASH }]
+
+  ChunksTable: # 벡터 저장소 (임베딩을 float32 바이너리로 저장, Lambda에서 코사인 유사도 검색)
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: paper_id, AttributeType: S }
+        - { AttributeName: idx, AttributeType: N }
+      KeySchema:
+        - { AttributeName: paper_id, KeyType: HASH }
+        - { AttributeName: idx, KeyType: RANGE }
+
+  ChatsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: user_id, AttributeType: S }
+        - { AttributeName: ts, AttributeType: N }
+      KeySchema:
+        - { AttributeName: user_id, KeyType: HASH }
+        - { AttributeName: ts, KeyType: RANGE }
+
+  UsageTable: # 사용자별 일일 호출 횟수 (하루 지나면 TTL로 자동 삭제)
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{ AttributeName: pk, AttributeType: S }]
+      KeySchema: [{ AttributeName: pk, KeyType: HASH }]
+      TimeToLiveSpecification: { AttributeName: expires_at, Enabled: true }
+
+  # ------------------------------------------------------------ 인증 (셀프 가입 차단: 관리자가 만든 계정만 로그인 가능)
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UsernameAttributes: [email]
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: false
+          RequireUppercase: false
+          RequireNumbers: false
+          RequireSymbols: false
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      PreventUserExistenceErrors: ENABLED
+      ExplicitAuthFlows: [ALLOW_USER_PASSWORD_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+
+  # ------------------------------------------------------------ API
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      DefaultRouteSettings: # API 전체 속도 제한 (초당 2건, 순간 최대 5건)
+        ThrottlingRateLimit: 2
+        ThrottlingBurstLimit: 5
+      Auth:
+        DefaultAuthorizer: CognitoJwt
+        Authorizers:
+          CognitoJwt:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}"
+              audience: [!Ref UserPoolClient]
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: api.handler
+      CodeUri: .build/
+      Timeout: 29
+      Environment:
+        Variables:
+          COLLECT_FUNCTION: !Ref CollectFunction
+          USAGE_TABLE: !Ref UsageTable
+          DAILY_LIMIT: !Ref DailyLimit
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref UsageTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref PapersTable }
+        - DynamoDBReadPolicy: { TableName: !Ref ChunksTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref ChatsTable }
+        - LambdaInvokePolicy: { FunctionName: !Ref CollectFunction }
+        - S3ReadPolicy: { BucketName: !Sub "${AWS::StackName}-docs-${AWS::AccountId}" }
+        - Statement:
+            - Effect: Allow
+              Action: ["bedrock:*", "bedrock-mantle:*"]
+              Resource: "*"
+      Events:
+        Search: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: /api/search, Method: POST } }
+        Chat: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: /api/chat, Method: POST } }
+        Summarize: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: /api/summarize, Method: POST } }
+        Cite: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: /api/cite, Method: POST } }
+        Papers: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: /api/papers, Method: GET } }
+        History: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: /api/history, Method: GET } }
+        Health: # 배포 확인용, 인증 없음
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /api/health, Method: GET, Auth: { Authorizer: NONE } }
+
+  # ------------------------------------------------------------ 데이터 준비
+  CollectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: collect.handler
+      CodeUri: .build/
+      Timeout: 900
+      MemorySize: 512
+      Environment:
+        Variables:
+          KEYWORDS: !Ref Keywords
+          MAX_PER_KEYWORD: "3"
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref PapersTable }
+        - S3CrudPolicy: { BucketName: !Sub "${AWS::StackName}-docs-${AWS::AccountId}" }
+      Events:
+        Daily:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 18 * * ? *) # 매일 03:00 KST
+
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: ingest.handler
+      CodeUri: .build/
+      Timeout: 600
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref PapersTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref ChunksTable }
+        - S3CrudPolicy: { BucketName: !Sub "${AWS::StackName}-docs-${AWS::AccountId}" }
+        - Statement:
+            - Effect: Allow
+              Action: ["bedrock:InvokeModel"]
+              Resource: "*"
+      Events:
+        PdfUploaded:
+          Type: S3
+          Properties:
+            Bucket: !Ref DocsBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - { Name: prefix, Value: papers/ }
+                  - { Name: suffix, Value: .pdf }
+
+  # ------------------------------------------------------------ 프런트엔드 (CloudFront + S3, /api/* 는 API Gateway로)
+  WebOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        PriceClass: PriceClass_200
+        Origins:
+          - Id: web
+            DomainName: !GetAtt WebBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt WebOAC.Id
+            S3OriginConfig: { OriginAccessIdentity: "" }
+          - Id: api
+            DomainName: !Sub "${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+            CustomOriginConfig: { OriginProtocolPolicy: https-only }
+        DefaultCacheBehavior:
+          TargetOriginId: web
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # CachingOptimized
+        CacheBehaviors:
+          - PathPattern: /api/*
+            TargetOriginId: api
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad # CachingDisabled
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac # AllViewerExceptHostHeader
+
+  WebBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub "${WebBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+
+  # ------------------------------------------------------------ 모니터링
+  ApiErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: 질의 API Lambda 에러 발생
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref ApiFunction }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  MonthlyBudget: # 월 예산의 80% 넘으면 이메일 경보
+    Type: AWS::Budgets::Budget
+    Condition: HasAlertEmail
+    Properties:
+      Budget:
+        BudgetName: !Sub "${AWS::StackName}-monthly"
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: { Amount: !Ref MonthlyBudgetUsd, Unit: USD }
+      NotificationsWithSubscribers:
+        - Notification: { NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 80 }
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref AlertEmail }]
+        - Notification: { NotificationType: FORECASTED, ComparisonOperator: GREATER_THAN, Threshold: 100 }
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref AlertEmail }]
+
+Outputs:
+  SiteUrl:
+    Value: !Sub "https://${Distribution.DomainName}"
+  DistributionId:
+    Value: !Ref Distribution
+  WebBucketName:
+    Value: !Ref WebBucket
+  DocsBucketName:
+    Value: !Ref DocsBucket
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  CollectFunctionName:
+    Value: !Ref CollectFunction

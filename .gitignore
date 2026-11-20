@@ -1,0 +1,41 @@
+# 과제 보고서 / 기획서 (저장소에 올리지 않음)
+docs/
+*.docx
+*.pdf
+
+# 빌드 산출물 (deploy.sh가 매번 새로 만듦)
+.build/
+.aws-sam/
+packaged.yaml
+
+# 배포 시 자동 생성되는 프런트 설정 (Cognito Client ID 등 계정별 값)
+web/config.js
+
+# AWS 자격 증명 / 비밀값 (콘솔에서 받은 키 csv 포함)
+.aws/
+credentials
+*.csv
+*accessKeys*
+rootkey*
+*.pem
+*.key
+.env
+.env.*
+samconfig.toml
+
+# 로그 (계정 ID, 리소스 이름 등이 찍힘)
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS / 에디터
+.DS_Store
+.vscode/
+.idea/
+
+# Office 임시 파일
+~$*
