@@ -15,8 +15,6 @@
 | 벡터 검색 | DynamoDB `Chunks` + Lambda 내 코사인 유사도 + 키워드 가산점 (하이브리드) |
 | 로그·모니터링 | CloudWatch Logs + CloudWatch Alarm(API Lambda 에러) |
 
-> **OpenSearch Serverless 대신 DynamoDB 벡터 저장을 쓴 이유:** OpenSearch Serverless는 최소 OCU 과금이 있어서 켜두기만 해도 한 달에 수십만 원이 나옴. 학생 데모 규모(논문 수십~수백 편)에선 DynamoDB에 임베딩을 저장하고 Lambda에서 유사도를 계산해도 충분히 빠름. 발표 때 "비용 최적화를 위한 설계 변경"이라고 설명하면 됨.
-
 ## 배포
 
 준비물: AWS CLI v2(`aws configure` 완료), Python 3, Bedrock 콘솔에서 **Claude Opus 5.5 / Titan Text Embeddings V2 모델 액세스 활성화** (기본은 us-east-1)
@@ -50,8 +48,6 @@
 | 긴 입력으로 토큰 폭탄 | 입력 2000자 제한, LLM 출력 4000토큰 상한, 검색 최대 5건 |
 | 오류 메시지로 내부 정보 노출 | 500 오류는 일반 메시지만 반환, 상세는 CloudWatch 로그에만 |
 | 그래도 비용이 샐 때 | AWS Budgets 월 예산 경보 + `./destroy.sh`로 즉시 전체 삭제 |
-
-> Cognito Client ID, CloudFront 주소는 원래 브라우저에 공개되는 값이라 비밀이 아님. 진짜 비밀은 **AWS 액세스 키** 하나뿐.
 
 ## 사용 흐름
 
