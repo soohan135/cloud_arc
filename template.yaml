@@ -9,7 +9,8 @@ Parameters:
     Description: Bedrock(임베딩/LLM)을 호출할 리전
   LlmModelId:
     Type: String
-    Default: anthropic.claude-opus-5-5
+    Default: us.amazon.nova-2-lite-v1:0
+    Description: "LLM 모델 ID (Claude 권한이 있으면 anthropic.claude-opus-5-5)"
   EmbedModelId:
     Type: String
     Default: amazon.titan-embed-text-v2:0
@@ -232,7 +233,6 @@ Resources:
       DistributionConfig:
         Enabled: true
         DefaultRootObject: index.html
-        PriceClass: PriceClass_200
         Origins:
           - Id: web
             DomainName: !GetAtt WebBucket.RegionalDomainName

@@ -15,7 +15,7 @@ from boto3.dynamodb.conditions import Key
 REGION = os.environ.get("AWS_REGION", "ap-northeast-2")
 BEDROCK_REGION = os.environ.get("BEDROCK_REGION", REGION)
 EMBED_MODEL_ID = os.environ.get("EMBED_MODEL_ID", "amazon.titan-embed-text-v2:0")
-LLM_MODEL_ID = os.environ.get("LLM_MODEL_ID", "anthropic.claude-opus-5-5")
+LLM_MODEL_ID = os.environ.get("LLM_MODEL_ID", "us.amazon.nova-2-lite-v1:0")
 EMBED_DIM = 512
 
 ddb = boto3.resource("dynamodb")
@@ -35,8 +35,20 @@ def safe_id(arxiv_id: str) -> str:
 
 
 def arxiv_search(query: str, max_results: int = 5) -> list[dict]:
+    # 버그 수정: "all:a b c"는 첫 단어에만 all:이 적용돼 엉뚱한 논문이 나옴 → 단어마다 all: + AND
+    terms = re.findall(r"[A-Za-z0-9][A-Za-z0-9-]*", query)[:4]  # 단어가 많으면 AND 조건이 너무 좁아져 0건
+    if not terms:
+        return []
+    out = _arxiv_query(" AND ".join(f"all:{t}" for t in terms), max_results)
+    if not out and len(terms) > 2:  # 결과 없으면 앞 2단어로 다시 검색
+        time.sleep(3)
+        out = _arxiv_query(" AND ".join(f"all:{t}" for t in terms[:2]), max_results)
+    return out
+
+
+def _arxiv_query(search_query: str, max_results: int) -> list[dict]:
     q = urllib.parse.urlencode({
-        "search_query": f"all:{query}",
+        "search_query": search_query,
         "start": 0,
         "max_results": max_results,
         "sortBy": "relevance",
@@ -151,11 +163,30 @@ def get_paper(paper_id: str) -> dict | None:
     return papers_tbl.get_item(Key={"paper_id": paper_id}).get("Item")
 
 
-# ---------------------------------------------------------------- LLM (Claude on Bedrock)
+# ---------------------------------------------------------------- LLM (Bedrock)
+# LLM_MODEL_ID가 "anthropic."으로 시작하면 Claude(Anthropic SDK), 그 외(Amazon Nova 등)는 Bedrock Converse API
 _llm = None
 
 
 def llm(system: str, user: str, max_tokens: int = 4000) -> str:  # 호출당 출력 토큰 상한
+    if not LLM_MODEL_ID.startswith("anthropic."):
+        return _converse(system, user, max_tokens)
+    return _claude(system, user, max_tokens)
+
+
+def _converse(system: str, user: str, max_tokens: int) -> str:
+    resp = bedrock.converse(
+        modelId=LLM_MODEL_ID,
+        system=[{"text": system}],
+        messages=[{"role": "user", "content": [{"text": user}]}],
+        inferenceConfig={"maxTokens": min(max_tokens, 5000), "temperature": 0.2},
+    )
+    if resp.get("stopReason") == "content_filtered":
+        return "요청이 모델 안전 정책에 의해 거절되었습니다."
+    return "".join(c.get("text", "") for c in resp["output"]["message"]["content"]).strip()
+
+
+def _claude(system: str, user: str, max_tokens: int) -> str:
     global _llm
     if _llm is None:
         from anthropic import AnthropicBedrockMantle

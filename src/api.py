@@ -7,6 +7,7 @@ GET  /api/papers                                   저장된 논문 목록
 GET  /api/history                                  내 대화 기록
 """
 import json
+import re
 import os
 import time
 
@@ -39,9 +40,12 @@ def take_quota(user) -> bool:
 
 GROUNDING = (
     "너는 연구 보조 AI '리서치메이트'다. 반드시 제공된 [근거] 안의 내용만 사용해 한국어로 답한다. "
-    "근거에 없는 내용은 추측하지 말고 '제공된 논문에서 확인할 수 없습니다'라고 말한다. "
-    "문장마다 해당 근거 번호를 [1], [2] 형식으로 표시한다."
+    "근거가 질문과 관련이 없으면 '제공된 논문에서 확인할 수 없습니다.' 한 문장만 답하고, 다른 내용은 덧붙이지 않는다. "
+    "각 문장 끝에 해당 근거 번호를 [1], [2] 형식으로 표시한다. 답변을 근거 번호 나열로 시작하지 않는다."
 )
+MIN_SCORE = 0.25  # 전체 검색 시 이보다 유사도가 낮으면 관련 논문 없음으로 판단 (LLM 호출 안 함)
+HANGUL = re.compile(r"[가-힣]")
+LEADING_CITES = re.compile(r"^\s*(\[\d+\]\s*,?\s*)+")
 
 
 def resp(code, body):
@@ -71,6 +75,9 @@ def search(user, body):
     q = (body.get("query") or "").strip()
     if not q:
         return resp(400, {"error": "query 필요"})
+    if HANGUL.search(q):  # arXiv는 영어 검색만 잘 됨 → 한국어 질의는 영어 키워드로 변환
+        q = llm("Translate the user's research topic into at most 4 English search words "
+                "(e.g. 'retrieval augmented generation hallucination'). Output only the words.", q, max_tokens=30)
     papers = arxiv_search(q, min(int(body.get("max", 5)), 5))
     new = [p for p in papers if save_paper_meta(p)]
     if new:  # PDF 다운로드는 수집 Lambda에 비동기로 넘김 → S3 이벤트 → 임베딩
@@ -78,7 +85,7 @@ def search(user, body):
                    Payload=json.dumps({"papers": new}).encode())
     for p in papers:
         p["status"] = (get_paper(p["paper_id"]) or {}).get("status", "pending")
-    return resp(200, {"papers": papers})
+    return resp(200, {"papers": papers, "keywords": q})
 
 
 def chat(user, body):
@@ -88,8 +95,12 @@ def chat(user, body):
     hits = vector_search(q, k=6, paper_id=body.get("paper_id"))
     if not hits:
         return resp(200, {"answer": "아직 인덱싱된 논문이 없습니다. 먼저 논문을 검색해 수집해 주세요.", "sources": []})
+    if not body.get("paper_id") and hits[0]["score"] < MIN_SCORE:  # 환각 방지: 관련 근거가 없으면 답변 생성 안 함
+        return resp(200, {"answer": "저장된 논문에서 이 질문과 관련된 내용을 찾지 못했습니다. "
+                                    "왼쪽 검색창에서 관련 논문을 먼저 검색해 수집해 주세요.", "sources": []})
     ctx, sources = build_context(hits)
     answer = llm(GROUNDING, f"[근거]\n{ctx}\n\n[질문]\n{q}")
+    answer = LEADING_CITES.sub("", answer)  # 모델이 답변 앞에 [1][2].. 를 나열하는 경우 제거
     chats_tbl.put_item(Item={"user_id": user, "ts": int(time.time() * 1000), "mode": "chat",
                              "question": q, "answer": answer})
     return resp(200, {"answer": answer, "sources": sources})
